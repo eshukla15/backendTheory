@@ -2595,6 +2595,1507 @@ app.post('/webhooks/payment', async (req, res) => {
 
 ---
 
+## Deep Dive: Background Tasks & Task Queuing
+
+### What are Background Tasks?
+
+**Definition**: Background tasks are any type of code that runs outside of the request-response lifecycle.
+
+**Key Characteristic**: The API responds to the client immediately without waiting for the task to complete.
+
+**Why Background Tasks?**
+
+When operations take too long to complete within an HTTP request timeout:
+- Sending emails
+- Processing images
+- Generating reports
+- Sending push notifications
+- Data imports/exports
+- Video transcoding
+- Batch operations
+
+**Without Background Tasks**:
+```
+Client → API → Process (5 seconds) → Response
+Client waits 5 seconds ❌
+```
+
+**With Background Tasks**:
+```
+Client → API → Queue Task → Immediate Response
+                     ↓
+              Background Worker processes task
+Client waits < 100ms ✅
+```
+
+---
+
+### Background Task Architecture
+
+**Common Flow**:
+
+1. **API receives request**
+2. **API validates and queues the task**
+3. **API returns immediate response** (usually 202 Accepted)
+4. **Background worker picks up task from queue**
+5. **Worker processes task**
+6. **Worker updates status/notifies user**
+
+**Example - Email Sending**:
+```javascript
+// API Endpoint
+app.post('/api/send-email', async (req, res) => {
+  const { to, subject, body } = req.body;
+  
+  // Validate input
+  if (!to || !subject || !body) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  // Queue the email task
+  const jobId = await emailQueue.add('send-email', {
+    to,
+    subject,
+    body,
+    userId: req.user.id
+  });
+  
+  // Respond immediately
+  res.status(202).json({ 
+    message: 'Email queued for sending',
+    jobId: jobId
+  });
+});
+
+// Background Worker
+emailQueue.process('send-email', async (job) => {
+  const { to, subject, body } = job.data;
+  
+  try {
+    await emailService.send({ to, subject, body });
+    console.log(`Email sent successfully to ${to}`);
+  } catch (error) {
+    console.error('Failed to send email:', error);
+    throw error; // Queue will retry
+  }
+});
+```
+
+---
+
+### Common Background Task Use Cases
+
+#### 1. Sending Emails
+```javascript
+// Order confirmation
+orderQueue.add('send-order-confirmation', {
+  orderId: order.id,
+  customerEmail: order.email,
+  items: order.items
+});
+```
+
+#### 2. Image Processing
+```javascript
+// Resize, optimize, generate thumbnails
+imageQueue.add('process-image', {
+  imageUrl: uploadedImage.url,
+  operations: [
+    { type: 'resize', width: 800, height: 600 },
+    { type: 'thumbnail', width: 150, height: 150 },
+    { type: 'optimize', quality: 85 }
+  ]
+});
+```
+
+#### 3. Report Generation
+```javascript
+// Generate monthly sales report
+reportQueue.add('generate-report', {
+  type: 'monthly-sales',
+  month: '2024-01',
+  userId: req.user.id,
+  format: 'pdf'
+}, {
+  priority: 2, // Lower priority
+  delay: 60000 // Wait 1 minute before starting
+});
+```
+
+#### 4. Push Notifications
+```javascript
+// Send notification to all users
+notificationQueue.add('broadcast-notification', {
+  title: 'New Feature Released!',
+  body: 'Check out our latest update',
+  targetUsers: 'all-active'
+});
+```
+
+#### 5. Data Import/Export
+```javascript
+// Import CSV with 100k rows
+importQueue.add('import-csv', {
+  fileUrl: csvFile.url,
+  model: 'products',
+  userId: req.user.id
+}, {
+  timeout: 300000 // 5 minute timeout
+});
+```
+
+---
+
+### Third-Party Task Queue Services
+
+**Most teams use managed services** rather than building their own:
+
+#### Popular Options:
+
+**1. AWS SQS (Simple Queue Service)**
+```javascript
+// Push to queue
+await sqs.sendMessage({
+  QueueUrl: QUEUE_URL,
+  MessageBody: JSON.stringify({
+    type: 'send-email',
+    data: { to, subject, body }
+  })
+});
+
+// Worker polls queue
+const messages = await sqs.receiveMessage({
+  QueueUrl: QUEUE_URL,
+  MaxNumberOfMessages: 10
+});
+```
+
+**2. Redis + Bull (Node.js)**
+```javascript
+const Queue = require('bull');
+const emailQueue = new Queue('emails', REDIS_URL);
+
+// Add job
+await emailQueue.add({ to, subject, body });
+
+// Process jobs
+emailQueue.process(async (job) => {
+  await sendEmail(job.data);
+});
+```
+
+**3. RabbitMQ**
+- Full-featured message broker
+- Supports multiple messaging patterns
+- Enterprise-grade reliability
+
+**4. Google Cloud Tasks**
+- Managed task queue service
+- HTTP-based task execution
+- Automatic retry and rate limiting
+
+**5. Celery (Python)**
+```python
+# Define task
+@app.task
+def send_email(to, subject, body):
+    email_service.send(to, subject, body)
+
+# Queue task
+send_email.delay('user@example.com', 'Hello', 'World')
+```
+
+---
+
+### Task Queue Features
+
+#### 1. Retry Logic
+```javascript
+emailQueue.add('send-email', data, {
+  attempts: 3,           // Retry up to 3 times
+  backoff: {
+    type: 'exponential', // Wait longer between retries
+    delay: 5000          // Start with 5 second delay
+  }
+});
+```
+
+#### 2. Priority Queues
+```javascript
+// High priority (process first)
+queue.add('urgent-task', data, { priority: 1 });
+
+// Normal priority
+queue.add('normal-task', data, { priority: 5 });
+
+// Low priority (process last)
+queue.add('bulk-task', data, { priority: 10 });
+```
+
+#### 3. Scheduled Tasks
+```javascript
+// Run task in 1 hour
+queue.add('reminder', data, {
+  delay: 3600000 // 1 hour in milliseconds
+});
+
+// Recurring tasks (cron-like)
+queue.add('daily-cleanup', data, {
+  repeat: {
+    cron: '0 2 * * *' // Every day at 2 AM
+  }
+});
+```
+
+#### 4. Rate Limiting
+```javascript
+queue.add('api-call', data, {
+  rateLimit: {
+    max: 100,      // Maximum 100 jobs
+    duration: 60000 // Per minute
+  }
+});
+```
+
+#### 5. Job Status Tracking
+```javascript
+// Add job and get ID
+const job = await queue.add('process-order', data);
+
+// Check status later
+const jobStatus = await queue.getJob(job.id);
+console.log(jobStatus.progress); // 0-100
+console.log(jobStatus.returnvalue); // Result after completion
+```
+
+---
+
+### Best Practices for Background Tasks
+
+**1. Make Tasks Idempotent**
+
+Tasks might run multiple times due to retries:
+```javascript
+// BAD - increments every time
+async function processPayment(orderId) {
+  await db.query('UPDATE orders SET attempts = attempts + 1 WHERE id = ?', [orderId]);
+}
+
+// GOOD - check if already processed
+async function processPayment(orderId) {
+  const order = await db.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+  
+  if (order.paymentStatus === 'completed') {
+    return; // Already processed
+  }
+  
+  // Process payment...
+}
+```
+
+**2. Keep Tasks Small and Focused**
+
+```javascript
+// BAD - one big task
+queue.add('process-order', { orderId });
+
+// GOOD - break into smaller tasks
+queue.add('charge-payment', { orderId });
+queue.add('send-confirmation', { orderId });
+queue.add('update-inventory', { orderId });
+queue.add('notify-warehouse', { orderId });
+```
+
+**3. Set Appropriate Timeouts**
+
+```javascript
+queue.add('quick-task', data, { timeout: 30000 }); // 30 seconds
+queue.add('long-task', data, { timeout: 600000 }); // 10 minutes
+```
+
+**4. Monitor Queue Health**
+
+```javascript
+// Check queue metrics
+const waiting = await queue.getWaitingCount();
+const active = await queue.getActiveCount();
+const failed = await queue.getFailedCount();
+
+if (waiting > 10000) {
+  alert('Queue backlog is too high!');
+}
+```
+
+**5. Handle Failures Gracefully**
+
+```javascript
+queue.on('failed', (job, error) => {
+  logger.error({
+    jobId: job.id,
+    jobType: job.name,
+    error: error.message,
+    data: job.data
+  });
+  
+  // Notify admin for critical tasks
+  if (job.name === 'process-payment') {
+    alertAdmin(`Payment processing failed: ${job.id}`);
+  }
+});
+```
+
+---
+
+## Elasticsearch - Deep Dive
+
+### What is Elasticsearch?
+
+Elasticsearch is a distributed, RESTful search and analytics engine built on **Apache Lucene**.
+
+**Core Purpose**: Fast, scalable full-text search
+
+**Key Features**:
+- Full-text search with relevance scoring
+- Real-time indexing and search
+- Distributed architecture (horizontal scaling)
+- RESTful API
+- Schema-free (flexible JSON documents)
+
+---
+
+### How Elasticsearch Works
+
+#### Inverted Index
+
+**Traditional Database**:
+```
+Document 1: "The quick brown fox"
+Document 2: "The lazy dog"
+Document 3: "Quick brown dogs"
+```
+
+Search for "quick" → Scan every document ❌ Slow
+
+**Inverted Index** (Elasticsearch's approach):
+```
+Term        | Document IDs
+------------|-------------
+the         | [1, 2]
+quick       | [1, 3]
+brown       | [1, 3]
+fox         | [1]
+lazy        | [2]
+dog         | [2]
+dogs        | [3]
+```
+
+Search for "quick" → Immediate lookup: [1, 3] ✅ Fast
+
+**How It Works**:
+1. Documents are analyzed and broken into terms (words)
+2. Each term maps to document IDs where it appears
+3. Searches look up terms in the index
+4. Results are ranked by relevance
+
+---
+
+### Apache Lucene
+
+**What is Apache Lucene?**
+
+- Core library that powers Elasticsearch
+- Written in Java
+- Provides indexing and search capabilities
+- Elasticsearch is essentially a distributed wrapper around Lucene
+
+**Elasticsearch's Addition**:
+- Distributed architecture
+- RESTful API
+- JSON-based
+- Cluster management
+- Replication and sharding
+
+---
+
+### Relevance Scoring
+
+Elasticsearch ranks search results by relevance using several factors:
+
+#### 1. Term Frequency (TF)
+
+How many times does the search term appear in a document?
+
+```
+Document 1: "elasticsearch elasticsearch elasticsearch"
+Document 2: "elasticsearch is powerful"
+
+Search for "elasticsearch"
+→ Document 1 scores higher (appears 3 times vs 1 time)
+```
+
+#### 2. Inverse Document Frequency (IDF)
+
+How rare is the term across all documents?
+
+```
+Common term: "the" (appears in 90% of documents) → Lower score
+Rare term: "elasticsearch" (appears in 5% of documents) → Higher score
+```
+
+**Why?** Rare terms are more meaningful for distinguishing relevant documents.
+
+#### 3. Document Length Normalization
+
+Shorter documents that contain the term rank higher than longer documents:
+
+```
+Document 1 (10 words): "elasticsearch tutorial"
+Document 2 (1000 words): "...elasticsearch..." (buried in text)
+
+Search for "elasticsearch"
+→ Document 1 scores higher (more focused on the topic)
+```
+
+#### 4. Field Boosting
+
+Give more weight to certain fields:
+
+```javascript
+{
+  "query": {
+    "multi_match": {
+      "query": "elasticsearch",
+      "fields": [
+        "title^3",        // 3x boost
+        "description^2",  // 2x boost
+        "content"         // 1x (default)
+      ]
+    }
+  }
+}
+```
+
+Match in title = 3x more important than match in content
+
+---
+
+### Elasticsearch in the ELK Stack
+
+**ELK = Elasticsearch + Logstash + Kibana**
+
+#### Complete Logging Solution:
+
+**1. Logstash** (Data Collection & Processing):
+```
+Application Logs → Logstash → Parse, Transform, Enrich → Elasticsearch
+```
+
+**Example Configuration**:
+```
+input {
+  file {
+    path => "/var/log/application.log"
+  }
+}
+
+filter {
+  grok {
+    match => { "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:message}" }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["localhost:9200"]
+    index => "application-logs-%{+YYYY.MM.dd}"
+  }
+}
+```
+
+**2. Elasticsearch** (Storage & Search):
+- Stores logs
+- Provides search capabilities
+- Aggregates data
+
+**3. Kibana** (Visualization):
+- Web interface for Elasticsearch
+- Create dashboards
+- Visualize metrics
+- Search and analyze logs
+
+**Complete Flow**:
+```
+Application → Logs → Logstash → Elasticsearch → Kibana Dashboard
+```
+
+---
+
+### Elasticsearch Use Cases
+
+#### 1. Application Search
+```javascript
+// Index products
+await elasticsearch.index({
+  index: 'products',
+  body: {
+    name: 'iPhone 14 Pro',
+    description: 'Latest iPhone with A16 chip',
+    category: 'smartphones',
+    price: 999
+  }
+});
+
+// Fuzzy search (handles typos)
+const results = await elasticsearch.search({
+  index: 'products',
+  body: {
+    query: {
+      fuzzy: {
+        name: {
+          value: 'iPhon',  // Typo
+          fuzziness: 'AUTO'
+        }
+      }
+    }
+  }
+});
+// Returns: iPhone 14 Pro
+```
+
+#### 2. Log Analysis
+```javascript
+// Search error logs from last hour
+const errors = await elasticsearch.search({
+  index: 'application-logs-*',
+  body: {
+    query: {
+      bool: {
+        must: [
+          { match: { level: 'ERROR' } },
+          { range: { timestamp: { gte: 'now-1h' } } }
+        ]
+      }
+    }
+  }
+});
+```
+
+#### 3. Real-time Analytics
+```javascript
+// Aggregate sales by region
+const analytics = await elasticsearch.search({
+  index: 'sales',
+  body: {
+    size: 0,
+    aggs: {
+      sales_by_region: {
+        terms: { field: 'region' },
+        aggs: {
+          total_revenue: { sum: { field: 'amount' } }
+        }
+      }
+    }
+  }
+});
+```
+
+---
+
+### Elasticsearch Best Practices
+
+**1. Not a Primary Database**
+
+```javascript
+// WRONG - Elasticsearch as primary database
+await elasticsearch.index({
+  index: 'users',
+  id: userId,
+  body: userData
+});
+
+// CORRECT - Database first, then index
+await db.createUser(userData);
+await elasticsearch.index({
+  index: 'users',
+  id: userId,
+  body: userData
+});
+```
+
+**2. Use Appropriate Analyzers**
+
+```javascript
+// Configure text analysis
+{
+  "settings": {
+    "analysis": {
+      "analyzer": {
+        "custom_analyzer": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "stop", "snowball"]
+        }
+      }
+    }
+  }
+}
+```
+
+**3. Implement Proper Index Management**
+
+```javascript
+// Use index aliases
+PUT /products-v1
+POST /_aliases
+{
+  "actions": [
+    { "add": { "index": "products-v1", "alias": "products" } }
+  ]
+}
+
+// Zero-downtime reindexing
+POST /_reindex
+{
+  "source": { "index": "products-v1" },
+  "dest": { "index": "products-v2" }
+}
+```
+
+---
+
+## Error Handling - A Fault-Tolerant Mindset
+
+### Why Fault Tolerance Matters
+
+**Goal**: Provide a seamless experience to users even when things go wrong.
+
+**Reality**: Systems fail. The question is how gracefully you handle failures.
+
+**Mindset Shift**:
+- Assume everything will fail eventually
+- Design for failure, not just success
+- Graceful degradation over complete failure
+
+---
+
+### Types of Errors in Backend Systems
+
+#### 1. Logic Errors
+
+**Characteristic**: Code runs without crashing, but produces unexpected results.
+
+**Examples**:
+```javascript
+// Wrong calculation
+function calculateDiscount(price, discountPercent) {
+  return price * discountPercent; // Should be price * (discountPercent / 100)
+}
+
+// Off-by-one error
+for (let i = 0; i <= array.length; i++) { // Should be i < array.length
+  console.log(array[i]); // Last iteration: undefined
+}
+
+// Wrong condition
+if (user.age > 18) { // Should be >=
+  allowAccess();
+}
+```
+
+**Prevention**:
+- Comprehensive testing
+- Code reviews
+- Input validation
+- Edge case testing
+
+---
+
+#### 2. Database Errors
+
+**Common Database Error Types**:
+
+**Connection Errors**:
+```javascript
+// Connection timeout
+Error: connect ETIMEDOUT
+Error: Too many connections
+Error: Connection lost
+
+// Handling
+const pool = mysql.createPool({
+  connectionLimit: 10,
+  connectTimeout: 10000,
+  acquireTimeout: 10000
+});
+
+pool.on('error', (err) => {
+  if (err.code === 'PROTOCOL_CONNECTION_LOST') {
+    // Reconnect
+  }
+});
+```
+
+**Constraint Violations**:
+```javascript
+// Unique constraint
+Error: duplicate key value violates unique constraint "users_email_key"
+
+// Foreign key constraint
+Error: insert or update on table violates foreign key constraint
+
+// Not null constraint
+Error: null value in column "username" violates not-null constraint
+
+// Handling
+try {
+  await db.createUser({ email: 'user@example.com' });
+} catch (error) {
+  if (error.code === '23505') { // PostgreSQL unique violation
+    return res.status(409).json({ 
+      error: 'Email already exists' 
+    });
+  }
+  throw error;
+}
+```
+
+**Query Errors**:
+```javascript
+// Syntax error
+Error: syntax error at or near "SELCT"
+
+// Invalid column
+Error: column "naem" does not exist
+
+// Handling
+async function safeQuery(query, params) {
+  try {
+    return await db.query(query, params);
+  } catch (error) {
+    logger.error({
+      query,
+      params,
+      error: error.message
+    });
+    
+    throw new DatabaseError('Query failed', { 
+      cause: error 
+    });
+  }
+}
+```
+
+---
+
+#### 3. Network/Connection Errors
+
+**Types**:
+- Timeout errors
+- Connection refused
+- DNS resolution failures
+- Network unreachable
+
+**Exponential Backoff Strategy**:
+
+```javascript
+async function retryWithBackoff(fn, maxRetries = 5) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      
+      // Calculate exponential backoff: 1s, 2s, 4s, 8s, 16s
+      const delay = Math.pow(2, i) * 1000;
+      
+      // Add jitter to prevent thundering herd
+      const jitter = Math.random() * 1000;
+      
+      await sleep(delay + jitter);
+      
+      console.log(`Retry ${i + 1}/${maxRetries} after ${delay}ms`);
+    }
+  }
+}
+
+// Usage
+const data = await retryWithBackoff(async () => {
+  return await externalApi.fetchData();
+});
+```
+
+**Why Exponential Backoff?**
+- Gives failing service time to recover
+- Prevents overwhelming the service with retries
+- Jitter prevents synchronized retry storms
+
+---
+
+#### 4. Service Outage / Third-Party API Failures
+
+**Scenario**: External service you depend on goes down.
+
+**Circuit Breaker Pattern**:
+
+```javascript
+class CircuitBreaker {
+  constructor(threshold = 5, timeout = 60000) {
+    this.failureCount = 0;
+    this.threshold = threshold;
+    this.timeout = timeout;
+    this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+    this.nextAttempt = Date.now();
+  }
+
+  async execute(fn) {
+    if (this.state === 'OPEN') {
+      if (Date.now() < this.nextAttempt) {
+        throw new Error('Circuit breaker is OPEN');
+      }
+      this.state = 'HALF_OPEN';
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+
+  onSuccess() {
+    this.failureCount = 0;
+    this.state = 'CLOSED';
+  }
+
+  onFailure() {
+    this.failureCount++;
+    if (this.failureCount >= this.threshold) {
+      this.state = 'OPEN';
+      this.nextAttempt = Date.now() + this.timeout;
+      console.log('Circuit breaker opened');
+    }
+  }
+}
+
+// Usage
+const paymentCircuit = new CircuitBreaker();
+
+app.post('/api/payment', async (req, res) => {
+  try {
+    const result = await paymentCircuit.execute(async () => {
+      return await paymentGateway.charge(req.body);
+    });
+    res.json(result);
+  } catch (error) {
+    // Fallback: queue for later processing
+    await paymentQueue.add('retry-payment', req.body);
+    res.status(503).json({ 
+      error: 'Payment service temporarily unavailable',
+      message: 'Your payment will be processed shortly'
+    });
+  }
+});
+```
+
+**States**:
+- **CLOSED**: Normal operation, requests go through
+- **OPEN**: Service is down, requests fail immediately
+- **HALF_OPEN**: Testing if service recovered
+
+---
+
+#### 5. Input Validation Errors
+
+**Never trust user input**:
+
+```javascript
+// Comprehensive validation
+const { body, validationResult } = require('express-validator');
+
+app.post('/api/users',
+  // Validation middleware
+  body('email').isEmail().normalizeEmail(),
+  body('age').isInt({ min: 0, max: 150 }),
+  body('username').isLength({ min: 3, max: 30 }).matches(/^[a-zA-Z0-9_]+$/),
+  
+  async (req, res) => {
+    // Check validation results
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        errors: errors.array() 
+      });
+    }
+    
+    // Process valid data
+    const user = await createUser(req.body);
+    res.status(201).json(user);
+  }
+);
+```
+
+**Validation Checklist**:
+- ✅ Type validation
+- ✅ Range validation
+- ✅ Format validation (email, phone, etc.)
+- ✅ Length validation
+- ✅ Sanitization (remove dangerous characters)
+- ✅ Business rule validation
+
+---
+
+#### 6. Configuration Errors
+
+**Common Issues**:
+- Missing environment variables
+- Invalid configuration values
+- Type mismatches
+
+**Solution - Validate on Startup**:
+
+```javascript
+const config = {
+  port: parseInt(process.env.PORT),
+  database: {
+    host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT),
+    name: process.env.DB_NAME
+  },
+  jwt: {
+    secret: process.env.JWT_SECRET,
+    expiresIn: process.env.JWT_EXPIRES_IN || '1h'
+  }
+};
+
+// Validate configuration
+function validateConfig() {
+  const required = [
+    'PORT',
+    'DB_HOST',
+    'DB_PORT',
+    'DB_NAME',
+    'JWT_SECRET'
+  ];
+
+  const missing = required.filter(key => !process.env[key]);
+
+  if (missing.length > 0) {
+    console.error(`Missing required environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+
+  if (isNaN(config.port) || config.port < 1 || config.port > 65535) {
+    console.error('Invalid PORT configuration');
+    process.exit(1);
+  }
+
+  console.log('✅ Configuration validated successfully');
+}
+
+// Run validation before starting server
+validateConfig();
+app.listen(config.port);
+```
+
+---
+
+### Error Handling Strategy
+
+**Layered Error Handling**:
+
+```javascript
+// Custom error classes
+class ApplicationError extends Error {
+  constructor(message, statusCode, isOperational = true) {
+    super(message);
+    this.statusCode = statusCode;
+    this.isOperational = isOperational;
+  }
+}
+
+class ValidationError extends ApplicationError {
+  constructor(message, errors = []) {
+    super(message, 400);
+    this.errors = errors;
+  }
+}
+
+class DatabaseError extends ApplicationError {
+  constructor(message) {
+    super(message, 500);
+  }
+}
+
+class NotFoundError extends ApplicationError {
+  constructor(resource) {
+    super(`${resource} not found`, 404);
+  }
+}
+
+// Global error handler
+app.use((error, req, res, next) => {
+  // Log error
+  logger.error({
+    error: error.message,
+    stack: error.stack,
+    url: req.url,
+    method: req.method,
+    userId: req.user?.id
+  });
+
+  // Operational vs Programming errors
+  if (!error.isOperational) {
+    // Programming error - something is seriously wrong
+    logger.fatal('Unhandled programming error:', error);
+    
+    // In production, might want to restart the process
+    if (process.env.NODE_ENV === 'production') {
+      process.exit(1);
+    }
+  }
+
+  // Send response
+  res.status(error.statusCode || 500).json({
+    error: {
+      message: error.message,
+      ...(error.errors && { errors: error.errors }),
+      ...(process.env.NODE_ENV === 'development' && { 
+        stack: error.stack 
+      })
+    }
+  });
+});
+```
+
+---
+
+## Logging vs Monitoring vs Observability
+
+These three concepts are often confused but serve different purposes:
+
+---
+
+### Logging
+
+**Definition**: A **record of discrete events** that occurred in your system.
+
+**Purpose**: Understand **what happened** in the past.
+
+**What to Log**:
+- Application events (user login, order placed)
+- Errors and exceptions
+- Request/response details
+- Business-critical operations
+- Security events
+
+**Log Levels**:
+```
+ERROR   - Something failed
+WARN    - Potential issue
+INFO    - Important events
+DEBUG   - Detailed information (development only)
+TRACE   - Very detailed (rarely used)
+```
+
+**Structured Logging Example**:
+```javascript
+// BAD - Unstructured logging
+console.log('User logged in');
+
+// GOOD - Structured logging
+logger.info({
+  event: 'user_login',
+  userId: user.id,
+  email: user.email,
+  ip: req.ip,
+  userAgent: req.headers['user-agent'],
+  timestamp: new Date().toISOString(),
+  duration: loginDuration
+});
+```
+
+**Benefits of Structured Logs**:
+- Easy to search and filter
+- Can be analyzed programmatically
+- Consistent format
+- Better for log aggregation tools
+
+**Metadata to Include**:
+- Timestamp
+- Log level
+- Event type
+- User ID (if applicable)
+- Request ID (for tracing)
+- IP address
+- Error details (message, stack trace)
+
+**Example with Winston (Node.js)**:
+```javascript
+const winston = require('winston');
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' })
+  ]
+});
+
+// Usage
+logger.info({
+  event: 'order_created',
+  orderId: order.id,
+  userId: user.id,
+  amount: order.total,
+  items: order.items.length
+});
+
+logger.error({
+  event: 'payment_failed',
+  orderId: order.id,
+  error: error.message,
+  stack: error.stack
+});
+```
+
+---
+
+### Monitoring
+
+**Definition**: **Real-time or near-real-time tracking** of system health and performance.
+
+**Purpose**: Understand the **current state** of your system.
+
+**What to Monitor**:
+
+**System Metrics**:
+- CPU usage
+- Memory usage
+- Disk I/O
+- Network traffic
+
+**Application Metrics**:
+- Request rate (requests per second)
+- Response time (latency)
+- Error rate (percentage of failed requests)
+- Throughput (data processed)
+
+**Business Metrics**:
+- Active users
+- Orders per minute
+- Revenue
+- Conversion rate
+
+**Example Metrics Collection**:
+```javascript
+const promClient = require('prom-client');
+
+// Register default metrics
+promClient.collectDefaultMetrics();
+
+// Custom metrics
+const httpRequestDuration = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code']
+});
+
+const activeUsers = new promClient.Gauge({
+  name: 'active_users',
+  help: 'Number of currently active users'
+});
+
+// Middleware to track request duration
+app.use((req, res, next) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    const duration = (Date.now() - start) / 1000;
+    httpRequestDuration
+      .labels(req.method, req.route?.path || 'unknown', res.statusCode)
+      .observe(duration);
+  });
+  
+  next();
+});
+
+// Expose metrics endpoint
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', promClient.register.contentType);
+  res.end(await promClient.register.metrics());
+});
+```
+
+**Alerting**:
+```javascript
+// Alert rules (typically in Prometheus)
+groups:
+  - name: api_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 5m
+        annotations:
+          summary: "High error rate detected"
+          
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, http_request_duration_seconds) > 2
+        for: 10m
+        annotations:
+          summary: "95th percentile response time above 2 seconds"
+```
+
+**Key Monitoring Tools**:
+- **Prometheus**: Metrics collection and storage
+- **Grafana**: Visualization and dashboards
+- **Datadog**: All-in-one monitoring platform
+- **New Relic**: Application performance monitoring
+
+---
+
+### Observability
+
+**Definition**: The ability to understand the **internal state** of your system by examining its **outputs** (logs, metrics, traces).
+
+**Purpose**: Answer **why** something happened and **how** it happened.
+
+**Three Pillars of Observability**:
+
+#### 1. Logs
+What events occurred?
+
+#### 2. Metrics
+How much/how many? (quantitative data)
+
+#### 3. Traces
+What was the path of a request through the system?
+
+---
+
+### Distributed Tracing
+
+**The Problem**:
+
+In microservices, a single user request might touch 5-10 different services:
+```
+User Request → API Gateway → Auth Service → User Service → Order Service → Payment Service → Email Service
+```
+
+When something goes slow or fails, **where** is the bottleneck?
+
+**The Solution: Distributed Tracing**
+
+Track the entire journey of a request across all services.
+
+**How It Works**:
+
+1. Generate a unique **Trace ID** for each request
+2. Each service creates a **Span** (segment of work)
+3. Spans are linked by the Trace ID
+4. Send spans to a tracing backend
+
+**Example with OpenTelemetry**:
+```javascript
+const { trace } = require('@opentelemetry/api');
+const tracer = trace.getTracer('my-service');
+
+app.get('/api/orders/:id', async (req, res) => {
+  // Create span for this operation
+  const span = tracer.startSpan('get_order');
+  
+  try {
+    span.setAttribute('order.id', req.params.id);
+    span.setAttribute('user.id', req.user.id);
+    
+    // Database query (creates child span)
+    const order = await getOrder(req.params.id);
+    
+    // External API call (creates child span)
+    const userDetails = await userService.getUser(order.userId);
+    
+    span.setStatus({ code: SpanStatusCode.OK });
+    res.json({ order, user: userDetails });
+    
+  } catch (error) {
+    span.recordException(error);
+    span.setStatus({ code: SpanStatusCode.ERROR });
+    throw error;
+  } finally {
+    span.end();
+  }
+});
+```
+
+**Trace Visualization**:
+```
+Trace ID: abc123
+Total Duration: 245ms
+
+|-- get_order (245ms)
+    |-- db_query (50ms)
+    |-- get_user (180ms)
+        |-- http_request (170ms)
+        |-- parse_response (10ms)
+    |-- serialize_response (15ms)
+```
+
+This shows:
+- Total request took 245ms
+- The `get_user` call took 180ms (bottleneck!)
+- Database query was fast (50ms)
+
+**Traces Help Answer**:
+- Which service is slow?
+- Where are requests failing?
+- What's the request flow?
+- How do services depend on each other?
+
+---
+
+### Observability Best Practices
+
+**1. Correlation IDs**
+
+Generate a unique ID for each request and include it in all logs:
+```javascript
+app.use((req, res, next) => {
+  req.correlationId = uuid();
+  res.setHeader('X-Correlation-ID', req.correlationId);
+  next();
+});
+
+logger.info({
+  correlationId: req.correlationId,
+  event: 'request_received',
+  method: req.method,
+  url: req.url
+});
+```
+
+**2. Context Propagation**
+
+Pass context (trace ID, user ID) through the entire request chain:
+```javascript
+// Service A
+const response = await axios.get('http://service-b/api/data', {
+  headers: {
+    'X-Trace-ID': req.traceId,
+    'X-User-ID': req.user.id
+  }
+});
+
+// Service B
+app.use((req, res, next) => {
+  req.traceId = req.headers['x-trace-id'];
+  req.userId = req.headers['x-user-id'];
+  next();
+});
+```
+
+**3. Standard Log Format**
+
+Use consistent format across all services:
+```javascript
+{
+  "timestamp": "2024-02-15T10:30:00Z",
+  "level": "INFO",
+  "service": "order-service",
+  "traceId": "abc123",
+  "correlationId": "xyz789",
+  "userId": "user-456",
+  "event": "order_created",
+  "orderId": "order-789",
+  "duration": 150,
+  "metadata": {
+    "items": 3,
+    "total": 99.99
+  }
+}
+```
+
+**4. Sampling for High-Traffic Systems**
+
+Don't trace every request in production (too expensive):
+```javascript
+// Sample 10% of requests
+const shouldTrace = Math.random() < 0.1;
+
+if (shouldTrace) {
+  const span = tracer.startSpan('operation');
+  // ... trace this request
+}
+```
+
+---
+
+### Observability Tools
+
+#### Tracing
+- **Jaeger**: Open-source distributed tracing
+- **Zipkin**: Alternative open-source tracer
+- **OpenTelemetry**: Vendor-neutral standard
+
+#### Complete Observability Platforms
+- **New Relic**: APM with logs, metrics, traces
+- **Datadog**: Full-stack observability
+- **Grafana Stack**: Grafana + Loki (logs) + Tempo (traces) + Prometheus (metrics)
+
+#### Log Aggregation
+- **ELK Stack**: Elasticsearch + Logstash + Kibana
+- **Splunk**: Enterprise log management
+- **Loki**: Lightweight log aggregation (by Grafana)
+
+---
+
+### Putting It All Together
+
+**Example: Debugging a Slow API Endpoint**
+
+**Step 1: Check Metrics** (Monitoring)
+```
+Dashboard shows:
+- 95th percentile response time: 3.5 seconds (usually 200ms)
+- Error rate: 0.5% (usually 0.1%)
+```
+
+**Step 2: Check Logs** (Logging)
+```
+Search for errors in last hour:
+level:ERROR AND timestamp:[now-1h TO now]
+
+Found: Multiple "Database timeout" errors
+```
+
+**Step 3: Check Traces** (Observability)
+```
+Find slow requests in tracing UI
+Trace shows:
+- API call: 50ms
+- Database query: 3000ms ← Bottleneck!
+- Response formatting: 10ms
+```
+
+**Step 4: Dive Deeper**
+```
+Check specific query in logs:
+Query: SELECT * FROM orders WHERE user_id = 123
+
+Check database metrics:
+- Query count spiked 10x
+- Missing index on user_id column!
+```
+
+**Solution**: Add database index, response time drops to 200ms.
+
+---
+
 ## Conclusion
 
 Backend engineering is about understanding core principles and applying them to build robust, scalable, and maintainable systems. While specific technologies and frameworks change, these fundamental concepts remain constant.
